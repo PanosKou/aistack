@@ -1,67 +1,144 @@
 import json
+import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, TypedDict
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from langgraph.graph import END, START, StateGraph
-from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
 load_dotenv()
 
-app = FastAPI(title="Onyx Local LangGraph Gateway", version="0.1.0")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+logger = logging.getLogger("local-ai-gateway")
 
 
-# -----------------------------
-# Environment
-# -----------------------------
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama:11434/v1")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "ollama")
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r. Using default=%s", name, raw, default)
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid float for %s=%r. Using default=%s", name, raw, default)
+        return default
+
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+
+# Defensive cleanup. This service calls native Ollama /api/chat internally.
+if OLLAMA_BASE_URL.endswith("/v1"):
+    OLLAMA_BASE_URL = OLLAMA_BASE_URL.removesuffix("/v1").rstrip("/")
+
+OLLAMA_NUM_CTX = env_int("OLLAMA_NUM_CTX", 4096)
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
+OLLAMA_HTTP_TIMEOUT = env_float("OLLAMA_HTTP_TIMEOUT", 300.0)
 
 LOCAL_FAST_MODEL = os.getenv("LOCAL_FAST_MODEL", "llama3.1:8b")
 LOCAL_CODE_MODEL = os.getenv("LOCAL_CODE_MODEL", "qwen2.5-coder:14b")
 LOCAL_REASON_MODEL = os.getenv("LOCAL_REASON_MODEL", "deepseek-r1:14b")
 
-
-# -----------------------------
-# Client
-# -----------------------------
-
-ollama_client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key=OLLAMA_API_KEY,
-)
+FAST_MAX_TOKENS = env_int("FAST_MAX_TOKENS", 256)
+CODE_MAX_TOKENS = env_int("CODE_MAX_TOKENS", 512)
+REASON_MAX_TOKENS = env_int("REASON_MAX_TOKENS", 768)
 
 
-# -----------------------------
-# API models
-# -----------------------------
+# =============================================================================
+# Schemas
+# =============================================================================
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = "onyx-auto"
-    messages: List[Dict[str, Any]]
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
-    stream: Optional[bool] = False
+    messages: list[dict[str, Any]]
+
+    stream: bool | None = False
+
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    seed: int | None = None
+    stop: str | list[str] | None = None
+
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+
+    response_format: dict[str, Any] | None = None
+    tools: list[dict[str, Any]] | None = None
 
 
-class GraphState(TypedDict, total=False):
-    request: Dict[str, Any]
-    route: Dict[str, Any]
-    response: Dict[str, Any]
+class ModelRoute(BaseModel):
+    requested_model: str
+    target_model: str
+    reason: str
 
 
-# -----------------------------
-# Routing rules
-# -----------------------------
+# =============================================================================
+# App lifecycle
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    timeout = httpx.Timeout(
+        timeout=OLLAMA_HTTP_TIMEOUT,
+        connect=10.0,
+        read=OLLAMA_HTTP_TIMEOUT,
+    )
+
+    app.state.http = httpx.AsyncClient(
+        base_url=OLLAMA_BASE_URL,
+        timeout=timeout,
+    )
+
+    logger.info("Gateway started. Ollama base URL: %s", OLLAMA_BASE_URL)
+
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+        logger.info("Gateway stopped")
+
+
+app = FastAPI(
+    title="Local AI Gateway",
+    version="0.2.0",
+    lifespan=lifespan,
+)
+
+
+# =============================================================================
+# Routing
+# =============================================================================
 
 CODE_KEYWORDS = [
     "code",
@@ -70,6 +147,8 @@ CODE_KEYWORDS = [
     "shell",
     "docker",
     "compose",
+    "docker compose",
+    "docker-compose",
     "kubernetes",
     "k8s",
     "terraform",
@@ -77,7 +156,6 @@ CODE_KEYWORDS = [
     "javascript",
     "typescript",
     "golang",
-    "go ",
     "rust",
     "cve",
     "devsecops",
@@ -91,10 +169,9 @@ CODE_KEYWORDS = [
     "stack trace",
     "error log",
     "vulnerability",
-    "sast",
-    "dast",
     "semgrep",
     "trivy",
+    "helm",
 ]
 
 REASONING_KEYWORDS = [
@@ -114,65 +191,78 @@ REASONING_KEYWORDS = [
     "design",
     "decision",
     "evaluate",
+    "investigate",
+    "why",
 ]
 
 
-def flatten_messages(messages: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
+def extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
 
-    for message in messages:
-        content = message.get("content", "")
+    if isinstance(content, list):
+        parts: list[str] = []
 
-        if isinstance(content, str):
-            parts.append(content)
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
 
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
+            if not isinstance(item, dict):
+                continue
 
-    return "\n".join(parts).lower()
+            if isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            elif isinstance(item.get("content"), str):
+                parts.append(item["content"])
+            elif item.get("type") == "image_url":
+                parts.append("[image omitted: text-only local gateway]")
+
+        return "\n".join(parts)
+
+    if content is None:
+        return ""
+
+    return str(content)
 
 
-def route_request(request: Dict[str, Any]) -> Dict[str, Any]:
-    requested_model = request.get("model", "onyx-auto")
-    messages = request.get("messages", [])
-    text = flatten_messages(messages)
+def flatten_messages(messages: list[dict[str, Any]]) -> str:
+    return "\n".join(
+        extract_text(message.get("content", ""))
+        for message in messages
+    ).lower()
 
-    # Direct Ollama model names.
-    if requested_model in {
+
+def route_request(request: ChatRequest) -> ModelRoute:
+    requested_model = request.model
+    text = flatten_messages(request.messages)
+
+    direct_models = {
         LOCAL_FAST_MODEL,
         LOCAL_CODE_MODEL,
         LOCAL_REASON_MODEL,
-        "llama3.1:8b",
-        "qwen2.5-coder:14b",
-        "deepseek-r1:14b",
-    }:
-        return {
-            "target_model": requested_model,
-            "reason": "direct local model requested",
-        }
+    }
 
-    # Gateway aliases.
-    if requested_model == "onyx-fast":
-        return {
-            "target_model": LOCAL_FAST_MODEL,
-            "reason": "fast alias",
-        }
+    if requested_model in direct_models:
+        return ModelRoute(
+            requested_model=requested_model,
+            target_model=requested_model,
+            reason="direct local model requested",
+        )
 
-    if requested_model == "onyx-code":
-        return {
-            "target_model": LOCAL_CODE_MODEL,
-            "reason": "code alias",
-        }
+    aliases = {
+        "onyx-fast": (LOCAL_FAST_MODEL, "fast alias"),
+        "onyx-code": (LOCAL_CODE_MODEL, "code alias"),
+        "onyx-reason": (LOCAL_REASON_MODEL, "reasoning alias"),
+    }
 
-    if requested_model == "onyx-reason":
-        return {
-            "target_model": LOCAL_REASON_MODEL,
-            "reason": "reasoning alias",
-        }
+    if requested_model in aliases:
+        target_model, reason = aliases[requested_model]
+        return ModelRoute(
+            requested_model=requested_model,
+            target_model=target_model,
+            reason=reason,
+        )
 
     if requested_model != "onyx-auto":
         raise HTTPException(
@@ -180,104 +270,301 @@ def route_request(request: Dict[str, Any]) -> Dict[str, Any]:
             detail=f"Unknown model alias: {requested_model}",
         )
 
-    # Automatic routing.
     if any(keyword in text for keyword in CODE_KEYWORDS):
-        return {
-            "target_model": LOCAL_CODE_MODEL,
-            "reason": "auto route: code/devsecops task",
-        }
+        return ModelRoute(
+            requested_model=requested_model,
+            target_model=LOCAL_CODE_MODEL,
+            reason="auto route: code/devsecops task",
+        )
 
     if any(keyword in text for keyword in REASONING_KEYWORDS):
-        return {
-            "target_model": LOCAL_REASON_MODEL,
-            "reason": "auto route: reasoning task",
-        }
+        return ModelRoute(
+            requested_model=requested_model,
+            target_model=LOCAL_REASON_MODEL,
+            reason="auto route: reasoning task",
+        )
 
-    return {
-        "target_model": LOCAL_FAST_MODEL,
-        "reason": "auto route: default fast model",
+    return ModelRoute(
+        requested_model=requested_model,
+        target_model=LOCAL_FAST_MODEL,
+        reason="auto route: default fast model",
+    )
+
+
+# =============================================================================
+# Ollama request conversion
+# =============================================================================
+
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+
+    for message in messages:
+        role = str(message.get("role", "user"))
+
+        # OpenAI has developer messages; Ollama does not.
+        if role == "developer":
+            role = "system"
+
+        if role not in {"system", "user", "assistant", "tool"}:
+            role = "user"
+
+        content = extract_text(message.get("content", ""))
+
+        if not content and role != "assistant":
+            continue
+
+        normalized.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    if not normalized:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid messages were provided",
+        )
+
+    return normalized
+
+
+def max_tokens_for(route: ModelRoute, request: ChatRequest) -> int:
+    if request.max_completion_tokens and request.max_completion_tokens > 0:
+        return request.max_completion_tokens
+
+    if request.max_tokens and request.max_tokens > 0:
+        return request.max_tokens
+
+    if route.target_model == LOCAL_CODE_MODEL:
+        return CODE_MAX_TOKENS
+
+    if route.target_model == LOCAL_REASON_MODEL:
+        return REASON_MAX_TOKENS
+
+    return FAST_MAX_TOKENS
+
+
+def ollama_options(route: ModelRoute, request: ChatRequest) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "num_ctx": OLLAMA_NUM_CTX,
+        "num_predict": max_tokens_for(route, request),
+        "temperature": 0.1 if request.temperature is None else request.temperature,
     }
 
+    if request.top_p is not None:
+        options["top_p"] = request.top_p
 
-def clean_payload_for_ollama(request: Dict[str, Any], target_model: str) -> Dict[str, Any]:
-    payload = dict(request)
-    payload["model"] = target_model
+    if request.top_k is not None:
+        options["top_k"] = request.top_k
 
-    # Defensive defaults.
-    payload.setdefault("temperature", 0.1)
+    if request.seed is not None:
+        options["seed"] = request.seed
 
-    # Remove fields that are gateway-only or not wanted.
-    payload.pop("cloud_allowed", None)
-    payload.pop("provider", None)
+    if isinstance(request.stop, str):
+        options["stop"] = [request.stop]
+    elif isinstance(request.stop, list):
+        options["stop"] = request.stop
+
+    return options
+
+
+def ollama_format(request: ChatRequest) -> Any | None:
+    response_format = request.response_format
+
+    if not isinstance(response_format, dict):
+        return None
+
+    if response_format.get("type") == "json_object":
+        return "json"
+
+    if response_format.get("type") == "json_schema":
+        json_schema = response_format.get("json_schema")
+        if isinstance(json_schema, dict):
+            schema = json_schema.get("schema")
+            if isinstance(schema, dict):
+                return schema
+
+    return None
+
+
+def build_ollama_payload(
+    route: ModelRoute,
+    request: ChatRequest,
+    stream: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": route.target_model,
+        "messages": normalize_messages(request.messages),
+        "stream": stream,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": ollama_options(route, request),
+    }
+
+    fmt = ollama_format(request)
+    if fmt is not None:
+        payload["format"] = fmt
+
+    if request.tools:
+        payload["tools"] = request.tools
 
     return payload
 
 
-# -----------------------------
-# LangGraph nodes
-# -----------------------------
+# =============================================================================
+# OpenAI-compatible response conversion
+# =============================================================================
 
-def route_node(state: GraphState) -> GraphState:
-    request = state["request"]
-    route = route_request(request)
+def chat_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex}"
+
+
+def finish_reason(done_reason: str | None) -> str:
+    if not done_reason:
+        return "stop"
+
+    if done_reason in {"stop", "length", "tool_calls"}:
+        return done_reason
+
+    if done_reason == "unload":
+        return "stop"
+
+    return done_reason
+
+
+def usage_from_ollama(data: dict[str, Any]) -> dict[str, int]:
+    prompt_tokens = int(data.get("prompt_eval_count") or 0)
+    completion_tokens = int(data.get("eval_count") or 0)
 
     return {
-        "request": request,
-        "route": route,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
     }
 
 
-def call_ollama_node(state: GraphState) -> GraphState:
-    request = state["request"]
-    route = state["route"]
+def openai_response(data: dict[str, Any], route: ModelRoute) -> dict[str, Any]:
+    message = data.get("message") or {}
 
-    payload = clean_payload_for_ollama(
-        request=request,
-        target_model=route["target_model"],
+    assistant_message: dict[str, Any] = {
+        "role": message.get("role", "assistant"),
+        "content": message.get("content") or "",
+    }
+
+    if isinstance(message.get("tool_calls"), list):
+        assistant_message["tool_calls"] = message["tool_calls"]
+
+    return {
+        "id": chat_id(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": route.requested_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": assistant_message,
+                "finish_reason": finish_reason(data.get("done_reason")),
+            }
+        ],
+        "usage": usage_from_ollama(data),
+        "gateway": {
+            "backend": "ollama-native-api-chat",
+            "target_model": route.target_model,
+            "route_reason": route.reason,
+        },
+    }
+
+
+def sse(data: dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def sse_done() -> str:
+    return "data: [DONE]\n\n"
+
+
+def stream_chunk(
+    response_id: str,
+    model: str,
+    delta: dict[str, Any],
+    finish: str | None = None,
+) -> str:
+    return sse(
+        {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish,
+                }
+            ],
+        }
     )
 
-    payload["stream"] = False
 
-    try:
-        response = ollama_client.chat.completions.create(**payload)
-        response_dict = response.model_dump()
-
-        # Keep the model name stable from the gateway perspective.
-        # The actual target remains visible via /health logs if needed.
-        return {
-            "request": request,
-            "route": route,
-            "response": response_dict,
-        }
-
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama backend error: {exc}",
-        ) from exc
+def stream_error(response_id: str, model: str, message: str) -> str:
+    return stream_chunk(
+        response_id=response_id,
+        model=model,
+        delta={"content": f"\n[Gateway error: {message}]"},
+        finish="stop",
+    )
 
 
-workflow = StateGraph(GraphState)
-workflow.add_node("route", route_node)
-workflow.add_node("ollama", call_ollama_node)
+# =============================================================================
+# Ollama calls
+# =============================================================================
 
-workflow.add_edge(START, "route")
-workflow.add_edge("route", "ollama")
-workflow.add_edge("ollama", END)
+async def call_ollama(
+    client: httpx.AsyncClient,
+    route: ModelRoute,
+    request: ChatRequest,
+) -> dict[str, Any]:
+    payload = build_ollama_payload(route, request, stream=False)
 
-graph = workflow.compile()
+    response = await client.post("/api/chat", json=payload)
+    response.raise_for_status()
+
+    return response.json()
 
 
-# -----------------------------
-# HTTP routes
-# -----------------------------
+async def stream_ollama(
+    client: httpx.AsyncClient,
+    route: ModelRoute,
+    request: ChatRequest,
+) -> AsyncIterator[dict[str, Any]]:
+    payload = build_ollama_payload(route, request, stream=True)
+
+    async with client.stream("POST", "/api/chat", json=payload) as response:
+        response.raise_for_status()
+
+        async for line in response.aiter_lines():
+            if not line:
+                continue
+
+            yield json.loads(line)
+
+
+# =============================================================================
+# API routes
+# =============================================================================
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
+async def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "mode": "local-only",
+        "mode": "openai-compatible-external-native-ollama-internal",
         "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_native_chat_url": f"{OLLAMA_BASE_URL}/api/chat",
+        "context": {
+            "num_ctx": OLLAMA_NUM_CTX,
+            "keep_alive": OLLAMA_KEEP_ALIVE,
+            "timeout_seconds": OLLAMA_HTTP_TIMEOUT,
+        },
         "models": {
             "onyx-auto": "keyword-routed local model",
             "onyx-fast": LOCAL_FAST_MODEL,
@@ -287,108 +574,172 @@ def health() -> Dict[str, Any]:
     }
 
 
+@app.get("/ready")
+async def ready() -> dict[str, Any]:
+    try:
+        response = await app.state.http.get("/api/tags")
+        response.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama is not ready: {exc}",
+        ) from exc
+
+    return {
+        "status": "ready",
+        "ollama": response.json(),
+    }
+
+
 @app.get("/v1/models")
-def list_models() -> Dict[str, Any]:
+async def list_models() -> dict[str, Any]:
     created = int(time.time())
 
     models = [
-        {
-            "id": "onyx-auto",
-            "object": "model",
-            "created": created,
-            "owned_by": "langgraph-gateway",
-        },
-        {
-            "id": "onyx-fast",
-            "object": "model",
-            "created": created,
-            "owned_by": "langgraph-gateway",
-        },
-        {
-            "id": "onyx-code",
-            "object": "model",
-            "created": created,
-            "owned_by": "langgraph-gateway",
-        },
-        {
-            "id": "onyx-reason",
-            "object": "model",
-            "created": created,
-            "owned_by": "langgraph-gateway",
-        },
-        {
-            "id": LOCAL_FAST_MODEL,
-            "object": "model",
-            "created": created,
-            "owned_by": "ollama",
-        },
-        {
-            "id": LOCAL_CODE_MODEL,
-            "object": "model",
-            "created": created,
-            "owned_by": "ollama",
-        },
-        {
-            "id": LOCAL_REASON_MODEL,
-            "object": "model",
-            "created": created,
-            "owned_by": "ollama",
-        },
+        ("onyx-auto", "local-ai-gateway"),
+        ("onyx-fast", "local-ai-gateway"),
+        ("onyx-code", "local-ai-gateway"),
+        ("onyx-reason", "local-ai-gateway"),
+        (LOCAL_FAST_MODEL, "ollama"),
+        (LOCAL_CODE_MODEL, "ollama"),
+        (LOCAL_REASON_MODEL, "ollama"),
     ]
 
     return {
         "object": "list",
-        "data": models,
+        "data": [
+            {
+                "id": model,
+                "object": "model",
+                "created": created,
+                "owned_by": owner,
+            }
+            for model, owner in models
+        ],
     }
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(request: ChatRequest) -> Any:
-    request_dict = request.model_dump(exclude_none=True)
+async def chat_completions(request: ChatRequest) -> Any:
+    route = route_request(request)
+
+    logger.info(
+        "chat request routed: requested=%s target=%s reason=%s stream=%s",
+        route.requested_model,
+        route.target_model,
+        route.reason,
+        request.stream,
+    )
 
     if request.stream:
-        route = route_request(request_dict)
-        target_model = route["target_model"]
-
-        payload = clean_payload_for_ollama(
-            request=request_dict,
-            target_model=target_model,
-        )
-        payload["stream"] = True
-
-        def event_stream():
-            try:
-                stream = ollama_client.chat.completions.create(**payload)
-
-                for chunk in stream:
-                    yield f"data: {chunk.model_dump_json()}\n\n"
-
-                yield "data: [DONE]\n\n"
-
-            except Exception as exc:
-                error_payload = {
-                    "id": f"chatcmpl-{uuid.uuid4().hex}",
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": target_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {
-                                "content": f"\n[Gateway error: {exc}]"
-                            },
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-
-                yield f"data: {json.dumps(error_payload)}\n\n"
-                yield "data: [DONE]\n\n"
-
         return StreamingResponse(
-            event_stream(),
+            openai_stream(request, route),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
 
-    result = graph.invoke({"request": request_dict})
-    return result["response"]
+    try:
+        data = await call_ollama(app.state.http, route, request)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:1000]}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama backend error: {exc}",
+        ) from exc
+
+    return openai_response(data, route)
+
+
+async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterator[str]:
+    response_id = chat_id()
+    role_sent = False
+
+    try:
+        async for data in stream_ollama(app.state.http, route, request):
+            if data.get("error"):
+                yield stream_error(response_id, route.requested_model, str(data["error"]))
+                yield sse_done()
+                return
+
+            message = data.get("message") or {}
+            content = message.get("content") or ""
+
+            if not role_sent:
+                delta: dict[str, Any] = {"role": "assistant"}
+                if content:
+                    delta["content"] = content
+
+                yield stream_chunk(response_id, route.requested_model, delta)
+                role_sent = True
+
+            elif content:
+                yield stream_chunk(
+                    response_id=response_id,
+                    model=route.requested_model,
+                    delta={"content": content},
+                )
+
+            if isinstance(message.get("tool_calls"), list):
+                yield stream_chunk(
+                    response_id=response_id,
+                    model=route.requested_model,
+                    delta={"tool_calls": message["tool_calls"]},
+                )
+
+            if data.get("done"):
+                yield stream_chunk(
+                    response_id=response_id,
+                    model=route.requested_model,
+                    delta={},
+                    finish=finish_reason(data.get("done_reason")),
+                )
+                yield sse_done()
+                return
+
+        yield stream_chunk(
+            response_id=response_id,
+            model=route.requested_model,
+            delta={},
+            finish="stop",
+        )
+        yield sse_done()
+
+    except httpx.HTTPStatusError as exc:
+        yield stream_error(
+            response_id=response_id,
+            model=route.requested_model,
+            message=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:1000]}",
+        )
+        yield sse_done()
+
+    except Exception as exc:
+        logger.exception("stream failed")
+
+        yield stream_error(
+            response_id=response_id,
+            model=route.requested_model,
+            message=str(exc),
+        )
+        yield sse_done()
+
+
+@app.post("/debug/route")
+async def debug_route(request: ChatRequest) -> dict[str, Any]:
+    route = route_request(request)
+
+    return {
+        "route": route.model_dump(),
+        "ollama_url": f"{OLLAMA_BASE_URL}/api/chat",
+        "ollama_payload": build_ollama_payload(
+            route=route,
+            request=request,
+            stream=bool(request.stream),
+        ),
+    }
