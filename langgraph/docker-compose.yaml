@@ -21,5 +21,5 @@ services:
       - ainet
 
 networks:
-  ainey:
+  ainet:
     external: true
