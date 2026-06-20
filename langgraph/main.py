@@ -12,7 +12,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -20,12 +19,10 @@ from pydantic import BaseModel, ConfigDict
 load_dotenv()
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-
 logger = logging.getLogger("local-ai-gateway")
 
 
@@ -33,7 +30,6 @@ def env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
-
     try:
         return int(raw)
     except ValueError:
@@ -45,7 +41,6 @@ def env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None:
         return default
-
     try:
         return float(raw)
     except ValueError:
@@ -53,9 +48,16 @@ def env_float(name: str, default: float) -> float:
         return default
 
 
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
 
-# Defensive cleanup. This service calls native Ollama /api/chat internally.
+# This gateway calls native Ollama /api/chat internally, not Ollama's /v1 API.
 if OLLAMA_BASE_URL.endswith("/v1"):
     OLLAMA_BASE_URL = OLLAMA_BASE_URL.removesuffix("/v1").rstrip("/")
 
@@ -63,25 +65,33 @@ OLLAMA_NUM_CTX = env_int("OLLAMA_NUM_CTX", 4096)
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 OLLAMA_HTTP_TIMEOUT = env_float("OLLAMA_HTTP_TIMEOUT", 300.0)
 
-LOCAL_FAST_MODEL = os.getenv("LOCAL_FAST_MODEL", "llama3.1:8b")
-LOCAL_CODE_MODEL = os.getenv("LOCAL_CODE_MODEL", "qwen2.5-coder:14b")
-LOCAL_REASON_MODEL = os.getenv("LOCAL_REASON_MODEL", "deepseek-r1:14b")
+LOCAL_FAST_MODEL = os.getenv("LOCAL_FAST_MODEL", "llama3.2:3b")
+LOCAL_CODE_MODEL = os.getenv("LOCAL_CODE_MODEL", "qwen2.5:7b")
+LOCAL_REASON_MODEL = os.getenv("LOCAL_REASON_MODEL", "deepseek-r1:7b")
 
-FAST_MAX_TOKENS = env_int("FAST_MAX_TOKENS", 256)
-CODE_MAX_TOKENS = env_int("CODE_MAX_TOKENS", 512)
-REASON_MAX_TOKENS = env_int("REASON_MAX_TOKENS", 768)
+FAST_MAX_TOKENS = env_int("FAST_MAX_TOKENS", 768)
+CODE_MAX_TOKENS = env_int("CODE_MAX_TOKENS", 1024)
+REASON_MAX_TOKENS = env_int("REASON_MAX_TOKENS", 1024)
 
+# If an OpenAI-compatible client sends tools with a weak alias such as onyx-fast,
+# route to the code/tool model. This keeps the UI light for normal chat while
+# preserving reliable MCP/tool calling.
+ROUTE_TO_CODE_WHEN_TOOLS = env_bool("ROUTE_TO_CODE_WHEN_TOOLS", True)
+
+# Streaming tool calls require OpenAI SSE tool-call delta handling. This gateway
+# implements converted SSE chunks by first making a non-stream Ollama tool call.
+STREAM_TOOLS_AS_CONVERTED_SSE = env_bool("STREAM_TOOLS_AS_CONVERTED_SSE", True)
 
 # =============================================================================
 # Schemas
 # =============================================================================
+
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str = "onyx-auto"
     messages: list[dict[str, Any]]
-
     stream: bool | None = False
 
     temperature: float | None = None
@@ -94,7 +104,10 @@ class ChatRequest(BaseModel):
     max_completion_tokens: int | None = None
 
     response_format: dict[str, Any] | None = None
+
+    # OpenAI-compatible tool/function calling input from Onyx.
     tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
 
 class ModelRoute(BaseModel):
@@ -107,6 +120,7 @@ class ModelRoute(BaseModel):
 # App lifecycle
 # =============================================================================
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(
@@ -114,14 +128,13 @@ async def lifespan(app: FastAPI):
         connect=10.0,
         read=OLLAMA_HTTP_TIMEOUT,
     )
-
+    limits = httpx.Limits(max_connections=20, max_keepalive_connections=5)
     app.state.http = httpx.AsyncClient(
         base_url=OLLAMA_BASE_URL,
         timeout=timeout,
+        limits=limits,
     )
-
     logger.info("Gateway started. Ollama base URL: %s", OLLAMA_BASE_URL)
-
     try:
         yield
     finally:
@@ -131,10 +144,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Local AI Gateway",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
-
 
 # =============================================================================
 # Routing
@@ -202,7 +214,6 @@ def extract_text(content: Any) -> str:
 
     if isinstance(content, list):
         parts: list[str] = []
-
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
@@ -215,6 +226,8 @@ def extract_text(content: Any) -> str:
                 parts.append(item["text"])
             elif isinstance(item.get("content"), str):
                 parts.append(item["content"])
+            elif item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
             elif item.get("type") == "image_url":
                 parts.append("[image omitted: text-only local gateway]")
 
@@ -231,6 +244,10 @@ def flatten_messages(messages: list[dict[str, Any]]) -> str:
         extract_text(message.get("content", ""))
         for message in messages
     ).lower()
+
+
+def has_tools(request: ChatRequest) -> bool:
+    return bool(request.tools) and request.tool_choice != "none"
 
 
 def route_request(request: ChatRequest) -> ModelRoute:
@@ -255,6 +272,13 @@ def route_request(request: ChatRequest) -> ModelRoute:
         "onyx-code": (LOCAL_CODE_MODEL, "code alias"),
         "onyx-reason": (LOCAL_REASON_MODEL, "reasoning alias"),
     }
+
+    if has_tools(request) and ROUTE_TO_CODE_WHEN_TOOLS and requested_model in {"onyx-auto", "onyx-fast", "onyx-reason"}:
+        return ModelRoute(
+            requested_model=requested_model,
+            target_model=LOCAL_CODE_MODEL,
+            reason="tools present: code/tool model route",
+        )
 
     if requested_model in aliases:
         target_model, reason = aliases[requested_model]
@@ -290,13 +314,54 @@ def route_request(request: ChatRequest) -> ModelRoute:
         reason="auto route: default fast model",
     )
 
-
 # =============================================================================
 # Ollama request conversion
 # =============================================================================
 
-def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
-    normalized: list[dict[str, str]] = []
+
+def parse_json_arguments(arguments: Any) -> Any:
+    if isinstance(arguments, str):
+        try:
+            return json.loads(arguments)
+        except json.JSONDecodeError:
+            return arguments
+    return arguments
+
+
+def ollama_tool_calls_from_openai(tool_calls: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(tool_calls, list):
+        return None
+
+    converted: list[dict[str, Any]] = []
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+
+        function = call.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+
+        name = function.get("name")
+        if not name:
+            continue
+
+        converted_call: dict[str, Any] = {
+            "function": {
+                "name": name,
+                "arguments": parse_json_arguments(function.get("arguments") or {}),
+            }
+        }
+
+        if call.get("id"):
+            converted_call["id"] = call["id"]
+
+        converted.append(converted_call)
+
+    return converted or None
+
+
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
 
     for message in messages:
         role = str(message.get("role", "user"))
@@ -310,15 +375,26 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
 
         content = extract_text(message.get("content", ""))
 
-        if not content and role != "assistant":
+        # Tool result messages can be empty in some client flows, but usually are not.
+        if not content and role not in {"assistant", "tool"}:
             continue
 
-        normalized.append(
-            {
-                "role": role,
-                "content": content,
-            }
-        )
+        normalized_message: dict[str, Any] = {
+            "role": role,
+            "content": content,
+        }
+
+        if role == "assistant":
+            converted_tool_calls = ollama_tool_calls_from_openai(message.get("tool_calls"))
+            if converted_tool_calls:
+                normalized_message["tool_calls"] = converted_tool_calls
+
+        if role == "tool" and message.get("tool_call_id"):
+            # Ollama currently does not require this, but preserving it is harmless
+            # for clients/models that support it.
+            normalized_message["tool_call_id"] = message["tool_call_id"]
+
+        normalized.append(normalized_message)
 
     if not normalized:
         raise HTTPException(
@@ -371,7 +447,6 @@ def ollama_options(route: ModelRoute, request: ChatRequest) -> dict[str, Any]:
 
 def ollama_format(request: ChatRequest) -> Any | None:
     response_format = request.response_format
-
     if not isinstance(response_format, dict):
         return None
 
@@ -405,15 +480,19 @@ def build_ollama_payload(
     if fmt is not None:
         payload["format"] = fmt
 
-    if request.tools:
+    # Ollama accepts OpenAI-style tools directly in /api/chat.
+    # We intentionally do not forward OpenAI's tool_choice field here because
+    # the local Ollama API path works correctly with tools alone, and accepting
+    # tool_choice on the gateway is enough for OpenAI-compatible clients.
+    if has_tools(request):
         payload["tools"] = request.tools
 
     return payload
 
-
 # =============================================================================
 # OpenAI-compatible response conversion
 # =============================================================================
+
 
 def chat_id() -> str:
     return f"chatcmpl-{uuid.uuid4().hex}"
@@ -423,7 +502,7 @@ def finish_reason(done_reason: str | None) -> str:
     if not done_reason:
         return "stop"
 
-    if done_reason in {"stop", "length", "tool_calls"}:
+    if done_reason in {"stop", "length", "tool_calls", "content_filter"}:
         return done_reason
 
     if done_reason == "unload":
@@ -443,16 +522,72 @@ def usage_from_ollama(data: dict[str, Any]) -> dict[str, int]:
     }
 
 
+def openai_tool_calls_from_ollama(message: dict[str, Any]) -> list[dict[str, Any]]:
+    native_calls = message.get("tool_calls") or []
+    converted: list[dict[str, Any]] = []
+
+    if not isinstance(native_calls, list):
+        return converted
+
+    for index, call in enumerate(native_calls):
+        if not isinstance(call, dict):
+            continue
+
+        function = call.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+
+        name = function.get("name")
+        arguments = function.get("arguments") or {}
+
+        if not name:
+            continue
+
+        if isinstance(arguments, str):
+            arguments_json = arguments
+        else:
+            arguments_json = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+        converted.append(
+            {
+                "id": call.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments_json,
+                },
+                # Helpful for streaming deltas. Harmless in non-streaming, but
+                # OpenAI's final non-stream tool_call object typically omits it.
+                "index": index,
+            }
+        )
+
+    return converted
+
+
+def strip_tool_call_index(tool_call: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(tool_call)
+    cleaned.pop("index", None)
+    return cleaned
+
+
 def openai_response(data: dict[str, Any], route: ModelRoute) -> dict[str, Any]:
-    message = data.get("message") or {}
+    ollama_message = data.get("message") or {}
+    tool_calls = openai_tool_calls_from_ollama(ollama_message)
 
-    assistant_message: dict[str, Any] = {
-        "role": message.get("role", "assistant"),
-        "content": message.get("content") or "",
-    }
-
-    if isinstance(message.get("tool_calls"), list):
-        assistant_message["tool_calls"] = message["tool_calls"]
+    if tool_calls:
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [strip_tool_call_index(call) for call in tool_calls],
+        }
+        choice_finish_reason = "tool_calls"
+    else:
+        assistant_message = {
+            "role": ollama_message.get("role", "assistant"),
+            "content": ollama_message.get("content") or "",
+        }
+        choice_finish_reason = finish_reason(data.get("done_reason"))
 
     return {
         "id": chat_id(),
@@ -463,7 +598,7 @@ def openai_response(data: dict[str, Any], route: ModelRoute) -> dict[str, Any]:
             {
                 "index": 0,
                 "message": assistant_message,
-                "finish_reason": finish_reason(data.get("done_reason")),
+                "finish_reason": choice_finish_reason,
             }
         ],
         "usage": usage_from_ollama(data),
@@ -515,9 +650,52 @@ def stream_error(response_id: str, model: str, message: str) -> str:
     )
 
 
+async def stream_openai_response_from_non_stream(data: dict[str, Any], route: ModelRoute) -> AsyncIterator[str]:
+    response_id = chat_id()
+    yield stream_chunk(
+        response_id=response_id,
+        model=route.requested_model,
+        delta={"role": "assistant"},
+    )
+
+    message = data.get("message") or {}
+    tool_calls = openai_tool_calls_from_ollama(message)
+
+    if tool_calls:
+        yield stream_chunk(
+            response_id=response_id,
+            model=route.requested_model,
+            delta={"tool_calls": tool_calls},
+        )
+        yield stream_chunk(
+            response_id=response_id,
+            model=route.requested_model,
+            delta={},
+            finish="tool_calls",
+        )
+        yield sse_done()
+        return
+
+    content = message.get("content") or ""
+    if content:
+        yield stream_chunk(
+            response_id=response_id,
+            model=route.requested_model,
+            delta={"content": content},
+        )
+
+    yield stream_chunk(
+        response_id=response_id,
+        model=route.requested_model,
+        delta={},
+        finish=finish_reason(data.get("done_reason")),
+    )
+    yield sse_done()
+
 # =============================================================================
 # Ollama calls
 # =============================================================================
+
 
 async def call_ollama(
     client: httpx.AsyncClient,
@@ -525,10 +703,8 @@ async def call_ollama(
     request: ChatRequest,
 ) -> dict[str, Any]:
     payload = build_ollama_payload(route, request, stream=False)
-
     response = await client.post("/api/chat", json=payload)
     response.raise_for_status()
-
     return response.json()
 
 
@@ -538,20 +714,17 @@ async def stream_ollama(
     request: ChatRequest,
 ) -> AsyncIterator[dict[str, Any]]:
     payload = build_ollama_payload(route, request, stream=True)
-
     async with client.stream("POST", "/api/chat", json=payload) as response:
         response.raise_for_status()
-
         async for line in response.aiter_lines():
             if not line:
                 continue
-
             yield json.loads(line)
-
 
 # =============================================================================
 # API routes
 # =============================================================================
+
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -570,6 +743,10 @@ async def health() -> dict[str, Any]:
             "onyx-fast": LOCAL_FAST_MODEL,
             "onyx-code": LOCAL_CODE_MODEL,
             "onyx-reason": LOCAL_REASON_MODEL,
+        },
+        "routing": {
+            "route_to_code_when_tools": ROUTE_TO_CODE_WHEN_TOOLS,
+            "stream_tools_as_converted_sse": STREAM_TOOLS_AS_CONVERTED_SSE,
         },
     }
 
@@ -594,7 +771,6 @@ async def ready() -> dict[str, Any]:
 @app.get("/v1/models")
 async def list_models() -> dict[str, Any]:
     created = int(time.time())
-
     models = [
         ("onyx-auto", "local-ai-gateway"),
         ("onyx-fast", "local-ai-gateway"),
@@ -605,30 +781,45 @@ async def list_models() -> dict[str, Any]:
         (LOCAL_REASON_MODEL, "ollama"),
     ]
 
-    return {
-        "object": "list",
-        "data": [
+    seen: set[str] = set()
+    data: list[dict[str, Any]] = []
+    for model, owner in models:
+        if model in seen:
+            continue
+        seen.add(model)
+        data.append(
             {
                 "id": model,
                 "object": "model",
                 "created": created,
                 "owned_by": owner,
             }
-            for model, owner in models
-        ],
+        )
+
+    return {
+        "object": "list",
+        "data": data,
     }
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatRequest) -> Any:
     route = route_request(request)
+    tool_names = [
+        tool.get("function", {}).get("name")
+        for tool in (request.tools or [])
+        if isinstance(tool, dict)
+    ]
 
     logger.info(
-        "chat request routed: requested=%s target=%s reason=%s stream=%s",
+        "chat request routed: requested=%s target=%s reason=%s stream=%s tools=%s tool_choice=%s tool_names=%s",
         route.requested_model,
         route.target_model,
         route.reason,
         request.stream,
+        bool(request.tools),
+        request.tool_choice,
+        tool_names,
     )
 
     if request.stream:
@@ -659,6 +850,32 @@ async def chat_completions(request: ChatRequest) -> Any:
 
 async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterator[str]:
     response_id = chat_id()
+
+    if has_tools(request) and STREAM_TOOLS_AS_CONVERTED_SSE:
+        try:
+            logger.info("stream request contains tools; using non-stream Ollama call and converted SSE response")
+            data = await call_ollama(app.state.http, route, request)
+            async for chunk in stream_openai_response_from_non_stream(data, route):
+                yield chunk
+            return
+        except httpx.HTTPStatusError as exc:
+            yield stream_error(
+                response_id=response_id,
+                model=route.requested_model,
+                message=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:1000]}",
+            )
+            yield sse_done()
+            return
+        except Exception as exc:
+            logger.exception("stream tool-call conversion failed")
+            yield stream_error(
+                response_id=response_id,
+                model=route.requested_model,
+                message=str(exc),
+            )
+            yield sse_done()
+            return
+
     role_sent = False
 
     try:
@@ -675,10 +892,8 @@ async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterato
                 delta: dict[str, Any] = {"role": "assistant"}
                 if content:
                     delta["content"] = content
-
                 yield stream_chunk(response_id, route.requested_model, delta)
                 role_sent = True
-
             elif content:
                 yield stream_chunk(
                     response_id=response_id,
@@ -686,19 +901,21 @@ async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterato
                     delta={"content": content},
                 )
 
-            if isinstance(message.get("tool_calls"), list):
+            tool_calls = openai_tool_calls_from_ollama(message)
+            if tool_calls:
                 yield stream_chunk(
                     response_id=response_id,
                     model=route.requested_model,
-                    delta={"tool_calls": message["tool_calls"]},
+                    delta={"tool_calls": tool_calls},
                 )
 
             if data.get("done"):
+                finish = "tool_calls" if tool_calls else finish_reason(data.get("done_reason"))
                 yield stream_chunk(
                     response_id=response_id,
                     model=route.requested_model,
                     delta={},
-                    finish=finish_reason(data.get("done_reason")),
+                    finish=finish,
                 )
                 yield sse_done()
                 return
@@ -718,10 +935,8 @@ async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterato
             message=f"Ollama HTTP {exc.response.status_code}: {exc.response.text[:1000]}",
         )
         yield sse_done()
-
     except Exception as exc:
         logger.exception("stream failed")
-
         yield stream_error(
             response_id=response_id,
             model=route.requested_model,
@@ -733,13 +948,15 @@ async def openai_stream(request: ChatRequest, route: ModelRoute) -> AsyncIterato
 @app.post("/debug/route")
 async def debug_route(request: ChatRequest) -> dict[str, Any]:
     route = route_request(request)
-
     return {
         "route": route.model_dump(),
         "ollama_url": f"{OLLAMA_BASE_URL}/api/chat",
+        "tools_present": bool(request.tools),
+        "tool_choice": request.tool_choice,
         "ollama_payload": build_ollama_payload(
             route=route,
             request=request,
             stream=bool(request.stream),
         ),
     }
+
