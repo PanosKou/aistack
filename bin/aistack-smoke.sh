@@ -9,11 +9,11 @@ API_KEY="${API_KEY:-local-dummy-key}"
 MODEL="${MODEL:-onyx-fast}"
 
 echo "=== systemd services ==="
-systemctl is-active --quiet hermes-bridge && echo "hermes-bridge: active" || { echo "hermes-bridge: FAILED"; exit 1; }
-systemctl is-active --quiet mcp-hermes-bridge && echo "mcp-hermes-bridge: active" || { echo "mcp-hermes-bridge: FAILED"; exit 1; }
+systemctl is-active --quiet web-research-bridge && echo "web-research-bridge: active" || { echo "web-research-bridge: FAILED"; exit 1; }
+systemctl is-active --quiet mcp-web-research && echo "mcp-web-research: active" || { echo "mcp-web-research: FAILED"; exit 1; }
 
 echo
-echo "=== hermes-bridge health ==="
+echo "=== web-research-bridge health ==="
 curl -fsS "$BRIDGE_URL/health" | jq '.'
 
 echo
