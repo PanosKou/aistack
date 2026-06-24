@@ -1,1 +1,9 @@
-!./searngx/
+.env
+.env.*
+!.env.example
+!.env.template
+
+__pycache__/
+*.py[cod]
+
+.DS_Store
