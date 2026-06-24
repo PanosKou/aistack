@@ -1,0 +1,97 @@
+# TODO - Add SAST/DAST
+name: ci
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway-ci:
+    name: Gateway basic CI
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Verify expected files
+        run: |
+          set -euo pipefail
+
+          test -f README.md
+          test -f langgraph/main.py
+          test -f langgraph/Dockerfile
+          test -f langgraph/docker-compose.yaml
+          test -f langgraph/requirements.txt
+          test -f langgraph/lang_smoke.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies and import app
+        working-directory: langgraph
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+          python -m py_compile main.py
+          python -c "import main; print('main import ok')"
+
+      - name: Validate Docker Compose config
+        run: |
+          set -euo pipefail
+
+          docker network create ainet 2>/dev/null || true
+          docker compose -f langgraph/docker-compose.yaml config
+
+      - name: Build Docker image
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -t local-ai-gateway:ci \
+            -f langgraph/Dockerfile \
+            langgraph
+
+      - name: Start container and check health
+        run: |
+          set -euo pipefail
+
+          docker network create ainet 2>/dev/null || true
+
+          docker compose \
+            -f langgraph/docker-compose.yaml \
+            up -d --build --wait --wait-timeout 90
+
+          docker compose -f langgraph/docker-compose.yaml ps
+
+          curl -fsS http://127.0.0.1:8000/health
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          docker compose -f langgraph/docker-compose.yaml logs --no-color || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f langgraph/docker-compose.yaml down -v --remove-orphans || true
