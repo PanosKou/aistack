@@ -28,7 +28,7 @@ services:
       - ollama:/root/.ollama
 
     ports:
-      - "127.0.0.1:11434:11434"
+      - "0.0.0.0:11434:11434"
 
     networks:
       - ainet
