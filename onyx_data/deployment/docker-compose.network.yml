@@ -1,0 +1,14 @@
+services:
+  api_server:
+    networks:
+      - default
+      - ainet
+
+  background:
+    networks:
+      - default
+      - ainet
+
+networks:
+  ainet:
+    external: true
