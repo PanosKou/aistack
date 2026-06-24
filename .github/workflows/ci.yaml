@@ -34,9 +34,13 @@ jobs:
           set -euo pipefail
 
           test -f README.md
+          test -f ollama/docker-compose.yaml
+          test -f onyx/deployment/docker-compose.yml
+          test -f onyx/deployment/docker-compose.network.yml
           test -f langgraph/main.py
           test -f langgraph/Dockerfile
           test -f langgraph/docker-compose.yaml
+          test -f langgraph/.env.example
           test -f langgraph/requirements.txt
           test -f langgraph/lang_smoke.sh
 
