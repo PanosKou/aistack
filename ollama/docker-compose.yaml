@@ -8,7 +8,7 @@ services:
       - "192.168.2.2:11434:11434"
 
     environment:
-      OLLAMA_HOST: 192.168.2.2:11434
+      OLLAMA_HOST: 0.0.0.0:11434
       # Allow the generation and embedding models simultaneously.
       OLLAMA_MAX_LOADED_MODELS: "2"
       # RECITALS MVP is initially low concurrency.
