@@ -5,21 +5,24 @@ services:
     restart: unless-stopped
 
     ports:
-      - "0.0.0.0:11434:11434"
+      - "192.168.2.2:11434:11434"
 
     environment:
-      OLLAMA_HOST: 0.0.0.0:11434
-
-      # NVIDIA container runtime
+      OLLAMA_HOST: 192.168.2.2:11434
+      # Allow the generation and embedding models simultaneously.
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      # RECITALS MVP is initially low concurrency.
+      OLLAMA_NUM_PARALLEL: "1"
+      # Keep the Mistral KV cache modest.
+      OLLAMA_CONTEXT_LENGTH: "8192"
+      # Retain loaded models indefinitely unless VRAM pressure forces eviction.
+      OLLAMA_KEEP_ALIVE: "-1m"
+      OLLAMA_MAX_QUEUE: "16"
+      # Reduce KV-cache memory consumption.
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-
-      # Safe limits
-      OLLAMA_CONTEXT_LENGTH: "8192"
-      OLLAMA_NUM_PARALLEL: "2"
-      OLLAMA_MAX_LOADED_MODELS: "3"
-      OLLAMA_MAX_QUEUE: "16"
-      OLLAMA_KEEP_ALIVE: "10m"
 
     volumes:
       - ollama:/root/.ollama
