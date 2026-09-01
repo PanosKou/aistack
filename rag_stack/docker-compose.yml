@@ -1,6 +1,28 @@
 name: recitals-rag
 
 services:
+  sftpgo:
+    image: drakkan/sftpgo:v2.7.5
+    container_name: recitals-sftpgo
+    restart: unless-stopped
+    environment:
+      SFTPGO_HTTPD__BINDINGS__0__ADDRESS: "0.0.0.0"
+      SFTPGO_HTTPD__BINDINGS__0__PORT: "8080"
+      SFTPGO_SFTPD__BINDINGS__0__PORT: "0"
+      SFTPGO_FTPD__BINDINGS__0__PORT: "0"
+      SFTPGO_WEBDAVD__BINDINGS__0__PORT: "0"
+      SFTPGO_COMMON__UPLOAD_MODE: "1"
+      SFTPGO_GRACE_TIME: "30"
+    volumes:
+      - ./sftpgo/storage:/srv/sftpgo
+      - ./sftpgo/config:/var/lib/sftpgo
+    ports:
+      - "127.0.0.1:8088:8080"
+    networks:
+      - ainet
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 35s
   qdrant:
     image: qdrant/qdrant:${QDRANT_IMAGE_TAG:?QDRANT_IMAGE_TAG is required}
     container_name: recitals-qdrant
@@ -47,6 +69,7 @@ services:
 
     volumes:
       - ./test-documents:/app/test-documents:ro
+      - ./sftpgo/storage/data:/app/documents:ro
 
     ports:
       - "127.0.0.1:8010:8000"
