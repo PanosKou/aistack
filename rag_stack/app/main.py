@@ -193,14 +193,26 @@ def serialize_results(
     retrieved_nodes: list[Any],
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    citation_by_document: dict[tuple[Any, Any], int] = {}
 
-    for position, item in enumerate(
-        retrieved_nodes,
-        start=1,
-    ):
+    for item in retrieved_nodes:
+        metadata = item.node.metadata
+        document_key = (
+            metadata.get("document_id"),
+            metadata.get("file_name"),
+        )
+
+        if document_key == (None, None):
+            document_key = (item.node.node_id, None)
+
+        if document_key not in citation_by_document:
+            citation_by_document[document_key] = (
+                len(citation_by_document) + 1
+            )
+
         results.append(
             {
-                "position": position,
+                "position": citation_by_document[document_key],
                 "score": item.score,
                 "text": item.node.get_content(
                     metadata_mode=MetadataMode.NONE,

@@ -9,3 +9,5 @@ llama-index-embeddings-ollama==0.9.0
 llama-index-llms-ollama==0.10.1
 
 qdrant-client==1.18.0
+
+docling-slim[convert-core,format-docx,format-pdf-pypdfium2]==2.124.0

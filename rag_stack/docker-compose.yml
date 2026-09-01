@@ -17,7 +17,7 @@ services:
       - ./sftpgo/storage:/srv/sftpgo
       - ./sftpgo/config:/var/lib/sftpgo
     ports:
-      - "127.0.0.1:8088:8080"
+      - "3000:8080"
     networks:
       - ainet
     security_opt:
@@ -66,7 +66,8 @@ services:
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
       RAG_API_KEY: ${RAG_API_KEY:?RAG_API_KEY is required}
       RECITALS_MODEL_ID: ${RECITALS_MODEL_ID:-recitals-rag}
-
+    group_add:
+      - "1000"
     volumes:
       - ./test-documents:/app/test-documents:ro
       - ./sftpgo/storage/data:/app/documents:ro

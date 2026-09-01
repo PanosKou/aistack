@@ -1,14 +1,23 @@
 import argparse
 import hashlib
 import os
+import subprocess
+import sys
 from pathlib import Path
 
+from docling.backend.msword_backend import MsWordDocumentBackend
+from docling.datamodel.base_models import InputFormat
+from docling.datamodel.document import InputDocument
 from llama_index.core import Document
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient, models
+
+
+SUPPORTED_SUFFIXES = {".docx", ".md", ".markdown", ".txt"}
+TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 
 
 def required_env(name: str) -> str:
@@ -45,13 +54,98 @@ def document_filter(document_id: str) -> models.Filter:
     )
 
 
+def extract_text(path: Path) -> str:
+    if path.suffix.lower() in TEXT_SUFFIXES:
+        return path.read_text(encoding="utf-8").strip()
+
+    if path.suffix.lower() == ".docx":
+        input_document = InputDocument(
+            path_or_stream=path,
+            format=InputFormat.DOCX,
+            backend=MsWordDocumentBackend,
+        )
+        backend = input_document._backend
+
+        if backend is None:
+            raise RuntimeError("Docling did not initialize the DOCX backend")
+
+        return backend.convert().export_to_markdown().strip()
+
+    raise ValueError(f"Unsupported document type: {path.suffix or '<none>'}")
+
+
+def discover_documents(directory: Path) -> tuple[list[Path], list[Path]]:
+    files = sorted(
+        candidate
+        for candidate in directory.rglob("*")
+        if candidate.is_file() and not candidate.is_symlink()
+    )
+    supported = [
+        candidate
+        for candidate in files
+        if candidate.suffix.lower() in SUPPORTED_SUFFIXES
+    ]
+    unsupported = [
+        candidate
+        for candidate in files
+        if candidate.suffix.lower() not in SUPPORTED_SUFFIXES
+    ]
+    return supported, unsupported
+
+
+def ingest_directory(directory: Path) -> None:
+    documents, unsupported = discover_documents(directory)
+
+    if not documents and not unsupported:
+        raise RuntimeError(f"No documents found in directory: {directory}")
+
+    failures: list[tuple[str, str]] = []
+    ingestion_failures = 0
+
+    for path in documents:
+        document_id = path.relative_to(directory).as_posix()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "app.ingest",
+                str(path),
+                "--document-id",
+                document_id,
+            ],
+            check=False,
+        )
+
+        if result.returncode != 0:
+            ingestion_failures += 1
+            failures.append((document_id, f"exit code {result.returncode}"))
+
+    for path in unsupported:
+        relative_path = path.relative_to(directory).as_posix()
+        failures.append((relative_path, "unsupported file type"))
+        print(f"Unsupported document: {relative_path}", file=sys.stderr)
+
+    print(
+        f"Batch summary: discovered={len(documents) + len(unsupported)} "
+        f"indexed={len(documents) - ingestion_failures} "
+        f"failed={len(failures)}"
+    )
+
+    if failures:
+        for document_id, reason in failures:
+            print(f"FAILED: {document_id}: {reason}", file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Index a Markdown or text document into RECITALS Qdrant."
+        description=(
+            "Index a supported document or directory tree into RECITALS Qdrant."
+        )
     )
     parser.add_argument(
         "path",
-        help="Path to a Markdown or text document.",
+        help="Path to a DOCX, Markdown or text document, or a directory.",
     )
     parser.add_argument(
         "--document-id",
@@ -61,15 +155,32 @@ def main() -> None:
 
     path = Path(args.path).resolve()
 
+    if path.is_dir():
+        if args.document_id:
+            raise ValueError("--document-id cannot be used with a directory")
+        ingest_directory(path)
+        return
+
     if not path.is_file():
         raise FileNotFoundError(f"Document does not exist: {path}")
 
-    if path.suffix.lower() not in {".md", ".markdown", ".txt"}:
+    if path.is_symlink():
+        raise ValueError(f"Symbolic links are not accepted: {path}")
+
+    if path.suffix.lower() not in SUPPORTED_SUFFIXES:
         raise ValueError(
-            "Initial ingestion supports only .md, .markdown and .txt files."
+            "Ingestion supports only .docx, .md, .markdown and .txt files."
         )
 
-    text = path.read_text(encoding="utf-8").strip()
+    max_document_bytes = integer_env("MAX_DOCUMENT_BYTES", 25 * 1024 * 1024)
+    document_size = path.stat().st_size
+
+    if document_size > max_document_bytes:
+        raise ValueError(
+            f"Document exceeds MAX_DOCUMENT_BYTES ({max_document_bytes}): {path}"
+        )
+
+    text = extract_text(path)
     if not text:
         raise ValueError(f"Document contains no text: {path}")
 
@@ -165,7 +276,11 @@ def main() -> None:
         metadata={
             "document_id": document_id,
             "file_name": path.name,
-            "source_type": "manual",
+            "source_type": (
+                "sftpgo"
+                if path.is_relative_to(Path("/app/documents"))
+                else "manual"
+            ),
             "source_path": str(path),
             "content_sha256": content_sha256,
         },
