@@ -1,0 +1,19 @@
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ping 34.12.39.3
+PING 34.12.39.3 (34.12.39.3) 56(84) bytes of data.
+^C
+--- 34.12.39.3 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2046ms
+
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ curl 34.12.39.3
+curl: (7) Failed to connect to 34.12.39.3 port 80 after 8 ms: Could not connect to server
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ curl -I 34.12.39.3:80
+curl: (7) Failed to connect to 34.12.39.3 port 80 after 8 ms: Could not connect to server
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ping 34.^C
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ^C
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ^C
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ^C
+pkoumantos@cei-brussels-sbx-002:~/aistack/ollama$ ping 34.12.39.3
+PING 34.12.39.3 (34.12.39.3) 56(84) bytes of data.
+^C
+--- 34.12.39.3 ping statistics ---
+3 packets transmitted, 0 received, 100% packet loss, time 2051ms
