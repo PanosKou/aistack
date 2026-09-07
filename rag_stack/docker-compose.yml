@@ -1,0 +1,95 @@
+name: recitals-rag
+
+services:
+  sftpgo:
+    image: drakkan/sftpgo:v2.7.5
+    container_name: recitals-sftpgo
+    restart: unless-stopped
+    environment:
+      SFTPGO_HTTPD__BINDINGS__0__ADDRESS: "0.0.0.0"
+      SFTPGO_HTTPD__BINDINGS__0__PORT: "8080"
+      SFTPGO_SFTPD__BINDINGS__0__PORT: "0"
+      SFTPGO_FTPD__BINDINGS__0__PORT: "0"
+      SFTPGO_WEBDAVD__BINDINGS__0__PORT: "0"
+      SFTPGO_COMMON__UPLOAD_MODE: "1"
+      SFTPGO_GRACE_TIME: "30"
+    volumes:
+      - ./sftpgo/storage:/srv/sftpgo
+      - ./sftpgo/config:/var/lib/sftpgo
+    ports:
+      - "3000:8080"
+    networks:
+      - ainet
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 35s
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_IMAGE_TAG:?QDRANT_IMAGE_TAG is required}
+    container_name: recitals-qdrant
+    restart: unless-stopped
+
+    environment:
+      QDRANT__LOG_LEVEL: INFO
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required}
+
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+    # Host diagnostics only. Other containers use recitals-qdrant:6333.
+    ports:
+      - "127.0.0.1:6333:6333"
+
+    networks:
+      - ainet
+
+    security_opt:
+      - no-new-privileges:true
+
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: recitals-rag-api:0.1.0
+    container_name: recitals-rag-api
+    restart: unless-stopped
+
+    environment:
+      QDRANT_URL: http://recitals-qdrant:6333
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?QDRANT_API_KEY is required}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-recitals_documents}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:?OLLAMA_BASE_URL is required}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-mistral:7b-instruct}
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-mxbai-embed-large:v1}
+      CHUNK_SIZE: ${CHUNK_SIZE:-400}
+      CHUNK_OVERLAP: ${CHUNK_OVERLAP:-50}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-5}
+      RAG_API_KEY: ${RAG_API_KEY:?RAG_API_KEY is required}
+      RECITALS_MODEL_ID: ${RECITALS_MODEL_ID:-recitals-rag}
+    group_add:
+      - "1000"
+    volumes:
+      - ./test-documents:/app/test-documents:ro
+      - ./sftpgo/storage/data:/app/documents:ro
+
+    ports:
+      - "127.0.0.1:8010:8000"
+
+    networks:
+      - ainet
+
+    depends_on:
+      qdrant:
+        condition: service_started
+
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  qdrant_storage:
+    name: recitals-rag-qdrant-storage
+
+networks:
+  ainet:
+    external: true
+    name: ainet
