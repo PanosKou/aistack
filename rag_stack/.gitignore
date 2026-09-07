@@ -1,0 +1,5 @@
+
+# Local runtime configuration
+.env
+.env.*
+!.env.example

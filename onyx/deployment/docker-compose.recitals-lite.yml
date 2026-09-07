@@ -137,14 +137,10 @@ services:
     networks:
       - default
       - ainet
-    ports:
+    ports: !override
       - mode: ingress
         target: 80
         published: "80"
-        protocol: tcp
-      - mode: ingress
-        target: 80
-        published: "3000"
         protocol: tcp
     restart: unless-stopped
     volumes:

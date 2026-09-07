@@ -7,3 +7,6 @@ __pycache__/
 *.py[cod]
 
 .DS_Store
+
+/rag_stack/sftpgo/storage/
+/rag_stack/sftpgo/config/
