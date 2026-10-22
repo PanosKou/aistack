@@ -3,8 +3,8 @@
 This repository contains the RECITALS proof-of-concept (PoC) deployment for
 document-grounded conversational inference. It uses Onyx as the user interface,
 a custom OpenAI-compatible RAG API for retrieval and response generation, and
-Ollama for local GPU inference.
-
+Ollama for local GPU inference. A small authenticated MCP server exposes the same
+grounded service to other AI applications.
 
 ## Current status
 
@@ -13,12 +13,12 @@ Ollama for local GPU inference.
 | Onyx browser chat | Implemented and validated |
 | Programmatic Onyx chat using a user PAT | Implemented and validated |
 | OpenAI-compatible `recitals-rag` endpoint | Implemented and validated |
+| Authenticated MCP Streamable HTTP endpoint | Implemented; deployment validation required |
 | DOCX, Markdown and text ingestion | Implemented and validated |
 | SFTPGo browser upload portal | Implemented and validated for the PoC |
 | LlamaIndex retrieval and grounded context | Implemented and validated |
 | Qdrant vector storage and source metadata | Implemented and validated |
 | Ollama generation and embedding models | Implemented and validated |
-
 
 The PoC was validated with two uploaded DOCX files. A grounded question returned
 the expected answer through both the RAG API and Onyx, with a deduplicated source
@@ -29,7 +29,9 @@ citation.
 ```mermaid
 flowchart TD
     Client["Browser or API client"] --> Onyx
+    AI["External AI application"] --> MCP["RECITALS MCP server"]
     Onyx --> RAG["RECITALS RAG API"]
+    MCP --> RAG
     RAG --> Qdrant
     RAG --> Ollama["Ollama / Mistral"]
     Uploader["Document uploader"] --> SFTPGo
@@ -42,22 +44,24 @@ flowchart TD
 The services share the external Docker network `ainet`. On the verified GCP
 deployment, Onyx, SFTPGo, the RAG API and Qdrant run on the general-services VM.
 Ollama runs on the dedicated NVIDIA L4 GPU VM and is reached over the private
-network.
+network. The MCP server calls the existing RAG API; it does not introduce another
+retrieval path or call Ollama directly.
 
 ## Components
 
 - `onyx/`: Onyx v4.0.0 Compose deployment and RECITALS Lite override.
 - `rag_stack/`: FastAPI RAG service, ingestion command, Qdrant and SFTPGo.
+- `rag_stack/mcp/`: authenticated MCP adapter with one `ask_recitals` tool.
 - `ollama/`: NVIDIA GPU Compose configuration for generation and embeddings.
-- Docling: extracts content from uploaded DOCX documents.
+- Docling: extracts content from uploaded documents.
 - LlamaIndex: chunks documents, creates retrieval queries and builds grounded
   context.
 - Qdrant: stores document chunks, 1024-dimensional embeddings and source
   metadata.
 
 The logical model name `recitals-rag` is the API model identifier exposed to
-Onyx. Reindexing does not create a new Ollama model: document embeddings are
-stored in Qdrant, while `mistral:7b-instruct` remains the generation model.
+Onyx and MCP. Reindexing does not create a new Ollama model: document embeddings
+are stored in Qdrant, while `mistral:7b-instruct` remains the generation model.
 
 ## Repository layout
 
@@ -76,6 +80,10 @@ stored in Qdrant, while `mistral:7b-instruct` remains the generation model.
     ├── app/
     │   ├── ingest.py
     │   └── main.py
+    ├── mcp/
+    │   ├── Dockerfile
+    │   ├── requirements.txt
+    │   └── server.py
     ├── Dockerfile
     ├── docker-compose.yml
     └── requirements.txt
@@ -101,7 +109,7 @@ docker network create ainet 2>/dev/null || true
 If Docker socket access is restricted for the current account, prefix Docker
 commands with `sudo`.
 
-## Configure the RAG stack
+## Configure the RAG and MCP stack
 
 Create `rag_stack/.env` with deployment-specific values. Do not commit it.
 
@@ -117,6 +125,12 @@ OLLAMA_EMBED_MODEL=mxbai-embed-large:v1
 RAG_API_KEY=<different-random-secret>
 RECITALS_MODEL_ID=recitals-rag
 
+MCP_API_KEY=<third-random-secret>
+MCP_BIND_ADDRESS=0.0.0.0
+MCP_HOST_PORT=8020
+MCP_PUBLIC_URL=http://<general-vm-public-ip>:8020/mcp
+MCP_AUTH_ISSUER_URL=http://<general-vm-public-ip>:8020/
+
 CHUNK_SIZE=400
 CHUNK_OVERLAP=50
 RETRIEVAL_TOP_K=5
@@ -124,9 +138,13 @@ RETRIEVAL_TOP_K=5
 
 Generate independent API keys, for example with `openssl rand -hex 32`.
 
+`MCP_AUTH_ISSUER_URL` is discovery metadata for the current static-token PoC.
+The MCP server does not issue tokens; the calling system is configured with the
+pre-shared `MCP_API_KEY` and sends it as a bearer token.
+
 ## Start the services
 
-Start the RAG API, Qdrant and SFTPGo on the general-services VM:
+Start the RAG API, MCP server, Qdrant and SFTPGo on the general-services VM:
 
 ```bash
 docker compose -f rag_stack/docker-compose.yml up -d --build
@@ -146,6 +164,7 @@ Verify the general-services stack:
 curl -fsS http://127.0.0.1:8010/health
 curl -fsS http://127.0.0.1:8010/ready
 curl -fsS http://127.0.0.1:6333/healthz
+curl -fsS http://127.0.0.1:8020/health
 ```
 
 ## Document upload and ingestion
@@ -203,9 +222,6 @@ Onyx Community does not provide service accounts. For PoC testing, a user can
 create a short-lived personal access token (PAT) and call the Onyx chat API with
 that user's permissions.
 
-Do not send a PAT over plaintext public HTTP. Use HTTPS or an SSH tunnel and set
-`ONYX_URL` to the protected endpoint.
-
 ```bash
 read -rsp 'Onyx PAT: ' ONYX_PAT
 printf '\n'
@@ -232,11 +248,65 @@ curl -fsS --max-time 300 \
 unset ONYX_PAT
 ```
 
+## MCP access for AI applications
+
+The MCP endpoint is `http://<general-vm-public-ip>:8020/mcp`. It exposes one
+tool:
+
+```text
+ask_recitals(question: string)
+```
+
+The tool forwards the question to the existing authenticated RAG API and returns
+its grounded answer and citations. Configure the external AI application with:
+
+```text
+Transport:     Streamable HTTP
+URL:           http://<general-vm-public-ip>:8020/mcp
+Authorization: Bearer <MCP_API_KEY>
+```
+
+This raw protocol example is useful for a smoke test:
+
+```bash
+read -rsp 'MCP API key: ' MCP_TOKEN
+printf '\n'
+
+curl -fsS \
+  http://<general-vm-public-ip>:8020/mcp \
+  -H "Authorization: Bearer ${MCP_TOKEN}" \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/call' \
+  -H 'Mcp-Name: ask_recitals' \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "ask_recitals",
+      "arguments": {
+        "question": "Which partner is responsible for the LLM component?"
+      },
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
+      }
+    }
+  }' | jq
+
+unset MCP_TOKEN
+```
+
 ## Network exposure and PoC limitations
 
 - Qdrant is bound to host loopback at `127.0.0.1:6333` and also uses an API key.
-- The RAG API is bound to host loopback at `127.0.0.1:8010`; Onyx reaches it on
-  `ainet` as `http://recitals-rag-api:8000`.
+- The RAG API is bound to host loopback at `127.0.0.1:8010`; Onyx and MCP reach
+  it on `ainet` as `http://recitals-rag-api:8000`.
 - SFTPGo currently publishes its WebClient on host port `3000` for the PoC.
-
-
+- MCP publishes port `8020` and requires a separate bearer token.
+- The current MCP endpoint uses plaintext HTTP. The token authenticates the
+  caller but does not encrypt traffic. Restrict the GCP firewall rule for port
+  `8020` to the other system's source IP address. HTTPS and identity-provider
+  integration remain MVP work.

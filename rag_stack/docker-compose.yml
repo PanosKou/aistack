@@ -23,6 +23,7 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 35s
+
   qdrant:
     image: qdrant/qdrant:${QDRANT_IMAGE_TAG:?QDRANT_IMAGE_TAG is required}
     container_name: recitals-qdrant
@@ -81,6 +82,36 @@ services:
     depends_on:
       qdrant:
         condition: service_started
+
+    security_opt:
+      - no-new-privileges:true
+
+  mcp:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+
+    image: recitals-mcp:0.1.0
+    container_name: recitals-mcp
+    restart: unless-stopped
+
+    environment:
+      MCP_API_KEY: ${MCP_API_KEY:?MCP_API_KEY is required}
+      MCP_PUBLIC_URL: ${MCP_PUBLIC_URL:-http://localhost:8020/mcp}
+      MCP_AUTH_ISSUER_URL: ${MCP_AUTH_ISSUER_URL:-http://localhost:8020/}
+      RAG_API_URL: http://recitals-rag-api:8000
+      RAG_API_KEY: ${RAG_API_KEY:?RAG_API_KEY is required}
+      RECITALS_MODEL_ID: ${RECITALS_MODEL_ID:-recitals-rag}
+
+    ports:
+      - "${MCP_BIND_ADDRESS:-0.0.0.0}:${MCP_HOST_PORT:-8020}:8000"
+
+    networks:
+      - ainet
+
+    depends_on:
+      rag-api:
+        condition: service_healthy
 
     security_opt:
       - no-new-privileges:true

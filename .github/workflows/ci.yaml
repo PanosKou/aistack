@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   rag-ci:
-    name: RAG API basic CI
+    name: RAG and MCP basic CI
     runs-on: ubuntu-latest
 
     defaults:
@@ -42,6 +42,9 @@ jobs:
           test -f rag_stack/Dockerfile
           test -f rag_stack/docker-compose.yml
           test -f rag_stack/requirements.txt
+          test -f rag_stack/mcp/server.py
+          test -f rag_stack/mcp/Dockerfile
+          test -f rag_stack/mcp/requirements.txt
 
           test ! -e rag_stack/sftpgo/config/sftpgo.db
           test -z "$(
@@ -62,10 +65,12 @@ jobs:
 
           python -m py_compile \
             rag_stack/app/main.py \
-            rag_stack/app/ingest.py
+            rag_stack/app/ingest.py \
+            rag_stack/mcp/server.py
 
       - name: Validate Docker Compose config
         env:
+          MCP_API_KEY: ci-mcp-key
           OLLAMA_BASE_URL: http://127.0.0.1:11434
           QDRANT_API_KEY: ci-qdrant-key
           QDRANT_IMAGE_TAG: v1.18.1
@@ -76,7 +81,7 @@ jobs:
           docker network create ainet 2>/dev/null || true
           docker compose -f rag_stack/docker-compose.yml config --quiet
 
-      - name: Build Docker image
+      - name: Build Docker images
         run: |
           set -euo pipefail
 
@@ -85,8 +90,14 @@ jobs:
             -f rag_stack/Dockerfile \
             rag_stack
 
-      - name: Start container and check health
+          docker build \
+            -t recitals-mcp:ci \
+            -f rag_stack/mcp/Dockerfile \
+            rag_stack/mcp
+
+      - name: Start containers and run smoke checks
         env:
+          MCP_API_KEY: ci-mcp-key
           OLLAMA_BASE_URL: http://127.0.0.1:11434
           QDRANT_API_KEY: ci-qdrant-key
           QDRANT_IMAGE_TAG: v1.18.1
@@ -99,7 +110,7 @@ jobs:
           docker compose \
             -f rag_stack/docker-compose.yml \
             up -d --build --wait --wait-timeout 180 \
-            qdrant rag-api
+            qdrant rag-api mcp
 
           docker compose -f rag_stack/docker-compose.yml ps
 
@@ -108,10 +119,41 @@ jobs:
             http://127.0.0.1:6333/healthz
           curl -fsS http://127.0.0.1:8010/health
           curl -fsS http://127.0.0.1:8010/ready
+          curl -fsS http://127.0.0.1:8020/health
+
+          test "$(
+            curl -sS \
+              -o /tmp/mcp-unauthorized.json \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/json' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+              http://127.0.0.1:8020/mcp
+          )" = "401"
+
+          curl -fsS \
+            http://127.0.0.1:8020/mcp \
+            -H "Authorization: Bearer ${MCP_API_KEY}" \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'Content-Type: application/json' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            -H 'Mcp-Method: tools/list' \
+            -d '{
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "tools/list",
+              "params": {
+                "_meta": {
+                  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                  "io.modelcontextprotocol/clientCapabilities": {}
+                }
+              }
+            }' |
+            jq -e '.result.tools | any(.name == "ask_recitals")'
 
       - name: Dump logs on failure
         if: failure()
         env:
+          MCP_API_KEY: ci-mcp-key
           OLLAMA_BASE_URL: http://127.0.0.1:11434
           QDRANT_API_KEY: ci-qdrant-key
           QDRANT_IMAGE_TAG: v1.18.1
@@ -124,6 +166,7 @@ jobs:
       - name: Cleanup
         if: always()
         env:
+          MCP_API_KEY: ci-mcp-key
           OLLAMA_BASE_URL: http://127.0.0.1:11434
           QDRANT_API_KEY: ci-qdrant-key
           QDRANT_IMAGE_TAG: v1.18.1
