@@ -1,0 +1,72 @@
+name: Trivy container scans
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'rag_stack/**'
+      - 'onyx/deployment/**'
+      - 'ollama/**'
+      - '.github/workflows/trivy.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'rag_stack/**'
+      - 'onyx/deployment/**'
+      - 'ollama/**'
+      - '.github/workflows/trivy.yaml'
+  schedule:
+    - cron: '27 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Scan ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - { image: 'recitals-rag-api:ci', context: rag_stack }
+          - { image: 'recitals-mcp:ci', context: rag_stack/mcp }
+          # One entry per distinct third-party image in the RECITALS PoC.
+          - { image: 'drakkan/sftpgo:v2.7.5' }
+          - { image: 'qdrant/qdrant:v1.18.1' }
+          - { image: 'ollama/ollama:latest' }
+          - { image: 'onyxdotapp/onyx-backend:v4.0.0' }
+          - { image: 'onyxdotapp/onyx-web-server:v4.0.0' }
+          - { image: 'onyxdotapp/onyx-model-server:v4.0.0' }
+          - { image: 'onyxdotapp/code-interpreter:latest' }
+          - { image: 'nginx:1.25.5-alpine' }
+          - { image: 'postgres:15.2-alpine' }
+          - { image: 'redis:7.4-alpine' }
+          - { image: 'opensearchproject/opensearch:3.6.0' }
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: matrix.context != ''
+        with:
+          persist-credentials: false
+
+      - name: Build project image
+        if: matrix.context != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          CONTEXT: ${{ matrix.context }}
+        run: docker build --tag "$IMAGE" "$CONTEXT"
+
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.76.2
+
+      - name: Report HIGH and CRITICAL vulnerabilities
+        env:
+          IMAGE: ${{ matrix.image }}
+          SOURCE: ${{ matrix.context && 'docker' || 'remote' }}
+        run: |
+          trivy image --image-src "$SOURCE" --scanners vuln --severity HIGH,CRITICAL \
+            --timeout 25m --no-progress --format table --exit-code 0 "$IMAGE"
